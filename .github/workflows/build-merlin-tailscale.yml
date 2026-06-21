@@ -1,0 +1,228 @@
+name: Build and Release ASUS Merlin tailscale.combined
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: "Optional version suffix. Empty means read VERSION.txt, for example 1.98.5"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "asus-merlin-*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build linux arm64 and arm32
+    runs-on: ubuntu-latest
+
+    env:
+      CGO_ENABLED: "0"
+      TS_TAGS: >-
+        ts_include_cli,
+        ts_omit_ace,
+        ts_omit_acme,
+        ts_omit_appconnectors,
+        ts_omit_aws,
+        ts_omit_bird,
+        ts_omit_captiveportal,
+        ts_omit_capture,
+        ts_omit_cliconndiag,
+        ts_omit_clientmetrics,
+        ts_omit_clientupdate,
+        ts_omit_cloud,
+        ts_omit_colorable,
+        ts_omit_completion,
+        ts_omit_completion_scripts,
+        ts_omit_conn25,
+        ts_omit_dbus,
+        ts_omit_debug,
+        ts_omit_debugeventbus,
+        ts_omit_debugportmapper,
+        ts_omit_desktop_sessions,
+        ts_omit_doctor,
+        ts_omit_drive,
+        ts_omit_gro,
+        ts_omit_hujsonconf,
+        ts_omit_identityfederation,
+        ts_omit_kube,
+        ts_omit_linkspeed,
+        ts_omit_linuxdnsfight,
+        ts_omit_logtail,
+        ts_omit_netlog,
+        ts_omit_netstack,
+        ts_omit_networkmanager,
+        ts_omit_oauthkey,
+        ts_omit_outboundproxy,
+        ts_omit_portlist,
+        ts_omit_posture,
+        ts_omit_qrcodes,
+        ts_omit_relayserver,
+        ts_omit_resolved,
+        ts_omit_sdnotify,
+        ts_omit_serve,
+        ts_omit_ssh,
+        ts_omit_synology,
+        ts_omit_syspolicy,
+        ts_omit_systray,
+        ts_omit_taildrop,
+        ts_omit_tailnetlock,
+        ts_omit_tap,
+        ts_omit_tpm,
+        ts_omit_tundevstats,
+        ts_omit_useproxy,
+        ts_omit_usermetrics,
+        ts_omit_wakeonlan,
+        ts_omit_webbrowser,
+        ts_omit_webclient
+
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v4
+
+      - name: Set version and release variables
+        shell: bash
+        env:
+          VERSION_OVERRIDE: ${{ github.event.inputs.version_override || '' }}
+        run: |
+          set -euo pipefail
+
+          tags="$(printf '%s' "$TS_TAGS" | tr -d '[:space:]')"
+          echo "TS_TAGS=$tags" >> "$GITHUB_ENV"
+
+          if [ -n "${VERSION_OVERRIDE:-}" ]; then
+            version="$(printf '%s' "$VERSION_OVERRIDE" | tr -d '[:space:]')"
+          else
+            version="$(tr -d '[:space:]' < VERSION.txt)"
+          fi
+
+          release_tag="asus-merlin-tailscale-${version}"
+          update_time="$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST')"
+          git_commit="$(git rev-parse HEAD 2>/dev/null || true)"
+          ldflags="-s -w -buildid= -X tailscale.com/version.longStamp=${version} -X tailscale.com/version.shortStamp=${version}"
+
+          if [ -n "$git_commit" ]; then
+            ldflags="${ldflags} -X tailscale.com/version.gitCommitStamp=${git_commit}"
+          fi
+
+          echo "TAILSCALE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
+          echo "RELEASE_NAME=ASUS Merlin tailscale.combined ${version}" >> "$GITHUB_ENV"
+          echo "UPDATE_TIME=$update_time" >> "$GITHUB_ENV"
+          echo "VERSION_LDFLAGS=$ldflags" >> "$GITHUB_ENV"
+
+          printf 'Version: %s\n' "$version"
+          printf 'Release tag: %s\n' "$release_tag"
+          printf 'Build tags: %s\n' "$tags"
+          printf 'Version ldflags: %s\n' "$ldflags"
+
+      - name: Show Tailscale Go toolchain
+        run: ./tool/go version
+
+      - name: Install UPX
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/upx.tar.xz \
+            https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-amd64_linux.tar.xz
+          tar -C /tmp -xf /tmp/upx.tar.xz
+          sudo install -m 0755 /tmp/upx-4.2.4-amd64_linux/upx /usr/local/bin/upx
+          upx --version
+
+      - name: Build linux-arm64 and linux-arm32 combined binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/unpacked dist/release
+
+          build_one() {
+            local label="$1"
+            local goarch="$2"
+            local goarm="${3:-}"
+            local out="tailscaled.combined-linux-${label}-${TAILSCALE_VERSION}"
+
+            export GOOS=linux
+            export GOARCH="$goarch"
+            export CGO_ENABLED=0
+            if [ -n "$goarm" ]; then
+              export GOARM="$goarm"
+            else
+              unset GOARM || true
+            fi
+
+            echo "Building ${out} with GOARCH=${GOARCH} GOARM=${goarm:-none}"
+            ./tool/go build \
+              -trimpath \
+              -buildvcs=false \
+              -tags "$TS_TAGS" \
+              -ldflags "$VERSION_LDFLAGS" \
+              -o "dist/unpacked/${out}.unpacked" \
+              ./cmd/tailscaled
+
+            cp "dist/unpacked/${out}.unpacked" "dist/release/${out}"
+            upx --best --lzma "dist/release/${out}"
+            upx -t "dist/release/${out}"
+            ./tool/go version -m "dist/unpacked/${out}.unpacked" > "dist/release/${out}.build-info.txt"
+          }
+
+          build_one "arm64" "arm64"
+          build_one "arm32" "arm" "7"
+
+          sha256sum \
+            "dist/release/tailscaled.combined-linux-arm64-${TAILSCALE_VERSION}" \
+            "dist/release/tailscaled.combined-linux-arm32-${TAILSCALE_VERSION}" \
+            > dist/release/SHA256SUMS
+          ls -lh dist/release | tee dist/release/files.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-combined-asus-merlin-${{ env.TAILSCALE_VERSION }}
+          path: |
+            dist/release/tailscaled.combined-linux-arm64-${{ env.TAILSCALE_VERSION }}
+            dist/release/tailscaled.combined-linux-arm32-${{ env.TAILSCALE_VERSION }}
+            dist/release/SHA256SUMS
+            dist/release/*.build-info.txt
+            dist/release/files.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          release_name: ${{ env.RELEASE_NAME }}
+          tag: ${{ env.RELEASE_TAG }}
+          overwrite: true
+          file_glob: true
+          file: dist/release/tailscaled.combined-linux-arm*-${{ env.TAILSCALE_VERSION }}
+          body: |
+            ASUSWRT-Merlin / official-mod Tailscale combined binaries.
+
+            Version: `${{ env.TAILSCALE_VERSION }}`
+            Build time: `${{ env.UPDATE_TIME }}`
+
+            Download:
+            - `tailscaled.combined-linux-arm64-${{ env.TAILSCALE_VERSION }}`
+            - `tailscaled.combined-linux-arm32-${{ env.TAILSCALE_VERSION }}`
+
+            Notes:
+            - `arm64`: `GOOS=linux GOARCH=arm64 CGO_ENABLED=0`
+            - `arm32`: `GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0`
+            - Both files are built from `./cmd/tailscaled` with `ts_include_cli`.
+            - CLI mode requires argv0 named `tailscale`, or `TS_BE_CLI=1`.
+            - Both files are compressed with `upx --best --lzma` and verified with `upx -t`.
+
+      - name: Write release links to summary
+        shell: bash
+        run: |
+          {
+            echo "## ASUS Merlin tailscale.combined"
+            echo
+            echo "Release: https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}"
+            echo
+            echo "- https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/tailscaled.combined-linux-arm64-${TAILSCALE_VERSION}"
+            echo "- https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/tailscaled.combined-linux-arm32-${TAILSCALE_VERSION}"
+          } >> "$GITHUB_STEP_SUMMARY"
